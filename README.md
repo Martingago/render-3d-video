@@ -66,3 +66,13 @@ Salidas adicionales en `outputs/`:
 La respuesta JSON de `POST /upload` incluye `animation_json`, `blender_glb`, `blender_video` y `blender_note` (motivo si el paso se omite o falla).
 
 El retarget es **heurístico**: cuaterniones se derivan de direcciones hueso-a-hueso respecto a vectores de reposo aproximados; no sustituye a un retargeter profesional ni a skinning manual. Para un GLB concreto puede ser necesario ajustar `REST_BONE_DIRECTIONS` en `animation_bridge.py` o los alias en `retarget_render.py`.
+
+### Estabilidad del esqueleto y cámara PyVista
+
+- El mapper aplica **escala robusta** (hombros o caderas), **amortiguación del eje z** de MediaPipe, **EMA más fuerte**, **límite de velocidad** por articulación y **corrección de signo** del eje forward del torso para reducir saltos y modelos “doblados”.
+- Cámara PyVista por defecto **`world`** (frente estable); con **`PYVISTA_CAMERA_VIEW=body`** en `.env` se vuelve al seguimiento al `torso_R`.
+
+### Ver Blender en vivo / logs
+
+- **`BLENDER_GUI=1`** en `.env`: se lanza Blender **sin** `--background` (se abre la ventana). Debes **cerrar Blender** cuando termine el script para que Flask siga.
+- **`BLENDER_LOG_OUTPUT=1`**: la salida estándar de Blender se mezcla con la consola del servidor (útil con `--background`).

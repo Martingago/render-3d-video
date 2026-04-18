@@ -5,6 +5,8 @@
 - Blender 3.6+ o 4.x instalado.
 - Variable de entorno `BLENDER_EXECUTABLE` con la ruta absoluta a **`blender.exe`** (no la carpeta del menú Inicio; en el Explorador suele estar bajo `C:\Program Files\Blender Foundation\Blender X.Y\blender.exe`), o `blender` / `blender.exe` en el `PATH`.
 - Opcional: archivo `.env` en la raíz del proyecto (copia de `.env.example`); Flask lo carga al arrancar.
+- **`BLENDER_GUI=1`**: abre la ventana de Blender (sin `--background`) para ver el import, keyframes y render; hay que cerrar Blender al finalizar.
+- **`BLENDER_LOG_OUTPUT=1`**: en modo consola, muestra la salida de Blender en la terminal de Flask.
 
 ## Modelo base
 

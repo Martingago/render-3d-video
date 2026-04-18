@@ -61,6 +61,16 @@ def retarget_script_path() -> str:
     return os.path.join(root, "blender_pipeline", "retarget_render.py")
 
 
+def _blender_use_gui() -> bool:
+    v = os.environ.get("BLENDER_GUI", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _blender_log_to_console() -> bool:
+    v = os.environ.get("BLENDER_LOG_OUTPUT", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def run_blender_retarget(
     json_path: str,
     input_model: str,
@@ -83,26 +93,36 @@ def run_blender_retarget(
     os.makedirs(os.path.dirname(os.path.abspath(output_glb)) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(output_mp4)) or ".", exist_ok=True)
 
-    cmd = [
-        blender,
-        "--background",
-        "--python",
-        script,
-        "--",
-        os.path.abspath(json_path),
-        os.path.abspath(input_model),
-        os.path.abspath(output_glb),
-        os.path.abspath(output_mp4),
-        str(fps),
-    ]
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout_sec,
+    cmd = [blender]
+    if not _blender_use_gui():
+        cmd.append("--background")
+    cmd.extend(
+        [
+            "--python",
+            script,
+            "--",
+            os.path.abspath(json_path),
+            os.path.abspath(input_model),
+            os.path.abspath(output_glb),
+            os.path.abspath(output_mp4),
+            str(fps),
+        ]
     )
+
+    use_gui = _blender_use_gui()
+    inherit_console = _blender_log_to_console() or use_gui
+    if inherit_console:
+        run_kw = {"stdout": None, "stderr": None}
+    else:
+        run_kw = {"capture_output": True, "text": True}
+
+    effective_timeout = None if use_gui else timeout_sec
+
+    proc = subprocess.run(cmd, timeout=effective_timeout, **run_kw)
     if proc.returncode != 0:
-        msg = proc.stderr or proc.stdout or "sin salida"
+        msg = "sin salida"
+        if not inherit_console and proc.stderr is not None:
+            msg = proc.stderr or proc.stdout or msg
         raise RuntimeError(f"Blender falló (código {proc.returncode}): {msg[:4000]}")
     return output_glb, output_mp4
 

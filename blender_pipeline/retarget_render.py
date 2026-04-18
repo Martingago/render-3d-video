@@ -4,12 +4,17 @@ Ejecutar solo dentro de Blender:
   blender --background --python blender_pipeline/retarget_render.py --
       <animation.json> <entrada.fbx|glb> <salida.glb> <salida.mp4> <fps>
 
+Variables de entorno opcionales (cámara MP4):
+  BLENDER_CAM_OFFSET — "x,y,z" offset mundo desde el foco (defecto: 0.45,-5.2,2.0)
+  BLENDER_CAM_ELEV_DEG — elevación extra en grados (defecto: 0)
+
 bpy no está disponible en el intérprete del servidor Flask.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 
@@ -19,6 +24,45 @@ def _argv_after_double_dash() -> list:
         return []
     i = sys.argv.index("--") + 1
     return sys.argv[i:]
+
+
+# Misma topología que animation_bridge.BONE_MP_EDGES (índices MediaPipe)
+LIMB_BONE_MP: tuple = (
+    ("LeftArm", 11, 13),
+    ("LeftForeArm", 13, 15),
+    ("LeftHand", 15, 19),
+    ("RightArm", 12, 14),
+    ("RightForeArm", 14, 16),
+    ("RightHand", 16, 20),
+    ("LeftUpLeg", 23, 25),
+    ("LeftLeg", 25, 27),
+    ("LeftFoot", 27, 31),
+    ("RightUpLeg", 24, 26),
+    ("RightLeg", 26, 28),
+    ("RightFoot", 28, 32),
+)
+
+
+def _parse_cam_offset() -> tuple:
+    raw = os.environ.get("BLENDER_CAM_OFFSET", "0.45,-5.2,2.0").strip()
+    try:
+        parts = [float(x.strip()) for x in raw.split(",")]
+        if len(parts) == 3:
+            return tuple(parts)
+    except ValueError:
+        pass
+    return (0.45, -5.2, 2.0)
+
+
+def _focal_from_joints_blender(jb: list) -> "Vector":
+    from mathutils import Vector
+
+    if not jb or len(jb) < 25:
+        return Vector((0.0, 0.0, 1.0))
+    j = [Vector(row) for row in jb]
+    hip = (j[23] + j[24]) * 0.5
+    sh = (j[11] + j[12]) * 0.5
+    return hip.lerp(sh, 0.55)
 
 
 def _pick_armature():
@@ -36,9 +80,6 @@ def _pick_armature():
 
 
 def _resolve_pose_bone(arm, json_bone_name: str):
-    """
-    Resuelve el hueso del rig: nombre JSON (p. ej. Hips) o con prefijo Mixamo mixamorig:Hips.
-    """
     pbs = arm.pose.bones
     name = json_bone_name.strip()
     candidates = [
@@ -83,6 +124,68 @@ def _set_all_bones_quaternion_mode(arm):
         pb.rotation_mode = "QUATERNION"
 
 
+def _swing_quat_from_world_dirs(arm, pb, v_target_world) -> "Quaternion":
+    """
+    Cuaternión (local del pose bone, aprox.) alineando el eje hueso en reposo
+    con la dirección objetivo en mundo (translation-invariante).
+    """
+    from mathutils import Vector, Quaternion
+
+    mw = arm.matrix_world.to_3x3()
+    d_arm = pb.bone.tail_local - pb.bone.head_local
+    if d_arm.length < 1e-8:
+        return Quaternion((1.0, 0.0, 0.0, 0.0))
+    d_arm.normalize()
+    d_rest_w = (mw @ d_arm).normalized()
+    vt = Vector(v_target_world)
+    if vt.length < 1e-8:
+        return Quaternion((1.0, 0.0, 0.0, 0.0))
+    vt.normalize()
+    if d_rest_w.dot(vt) < -0.99999:
+        axis = d_rest_w.orthogonal()
+        axis.normalize()
+        return Quaternion(axis, math.pi)
+    return d_rest_w.rotation_difference(vt)
+
+
+def _keyframe_camera_rig(scene, cam, empty, frames: list, elev_deg: float):
+    from mathutils import Euler, Vector
+
+    off = Vector(_parse_cam_offset())
+    elev = math.radians(elev_deg)
+    if abs(elev) > 1e-6:
+        rot = Euler((elev, 0.0, 0.0), "XYZ")
+        off.rotate(rot)
+
+    for fi, frame in enumerate(frames):
+        fnum = 1 + fi
+        scene.frame_set(fnum)
+        jb = frame.get("joints_blender")
+        rt = frame.get("root_translation")
+        if jb and len(jb) >= 33:
+            target = _focal_from_joints_blender(jb)
+        elif rt is not None:
+            target = Vector(
+                (
+                    float(rt[0]),
+                    float(rt[1]),
+                    float(rt[2]),
+                )
+            )
+        else:
+            target = Vector((0.0, 0.0, 1.0))
+
+        empty.location = target
+        empty.keyframe_insert(data_path="location", frame=fnum)
+
+        cam.location = target + off
+        cam.keyframe_insert(data_path="location", frame=fnum)
+        direction = target - cam.location
+        if direction.length > 1e-8:
+            cam.rotation_euler = direction.to_track_quat("NEG_Z", "Y").to_euler()
+            cam.keyframe_insert(data_path="rotation_euler", frame=fnum)
+
+
 def main() -> None:
     import bpy
     from mathutils import Quaternion, Vector
@@ -101,6 +204,8 @@ def main() -> None:
     out_glb = os.path.abspath(args[2])
     out_mp4 = os.path.abspath(args[3])
     fps = float(args[4])
+
+    elev_cam = float(os.environ.get("BLENDER_CAM_ELEV_DEG", "0"))
 
     with open(json_path, "r", encoding="utf-8") as f:
         doc = json.load(f)
@@ -141,6 +246,8 @@ def main() -> None:
     scene.frame_start = 1
     scene.frame_end = len(frames)
 
+    limb_names = {name for name, _, _ in LIMB_BONE_MP}
+
     for fi, frame in enumerate(frames):
         fnum = 1 + fi
         scene.frame_set(fnum)
@@ -152,8 +259,36 @@ def main() -> None:
             )
             arm.keyframe_insert(data_path="location", frame=fnum)
 
+        jb = frame.get("joints_blender")
         bones_data = frame.get("bones", {})
+
+        for bone_name, ia, ib in LIMB_BONE_MP:
+            pb = _resolve_pose_bone(arm, bone_name)
+            if pb is None:
+                continue
+            pb.rotation_mode = "QUATERNION"
+            if jb and len(jb) > ib:
+                va = Vector((float(jb[ia][0]), float(jb[ia][1]), float(jb[ia][2])))
+                vb = Vector((float(jb[ib][0]), float(jb[ib][1]), float(jb[ib][2])))
+                v_tgt = vb - va
+                q = _swing_quat_from_world_dirs(arm, pb, v_tgt)
+            else:
+                qlist = bones_data.get(bone_name)
+                if not qlist:
+                    continue
+                qw, qx, qy, qz = (
+                    float(qlist[0]),
+                    float(qlist[1]),
+                    float(qlist[2]),
+                    float(qlist[3]),
+                )
+                q = Quaternion((qw, qx, qy, qz))
+            pb.rotation_quaternion = q
+            pb.keyframe_insert(data_path="rotation_quaternion", frame=fnum)
+
         for json_bone_name, qlist in bones_data.items():
+            if json_bone_name in limb_names:
+                continue
             pb = _resolve_pose_bone(arm, json_bone_name)
             if pb is None:
                 continue
@@ -186,17 +321,20 @@ def main() -> None:
     except TypeError:
         bpy.ops.export_scene.gltf(**export_kw)
 
-    bpy.ops.object.light_add(type="SUN", location=(5.0, -3.0, 10.0))
+    bpy.ops.object.light_add(type="SUN", location=(6.0, -4.0, 10.0))
     sun = bpy.context.active_object
-    sun.data.energy = 2.5
+    sun.data.energy = 2.8
 
-    bpy.ops.object.camera_add(location=(2.5, -3.2, 1.75))
+    bpy.ops.object.empty_add(type="PLAIN_AXES", location=(0.0, 0.0, 1.0))
+    empty = bpy.context.active_object
+    empty.name = "CamTarget"
+
+    bpy.ops.object.camera_add(location=(0.0, -5.0, 2.0))
     cam = bpy.context.active_object
+    cam.name = "RenderCam"
     scene.camera = cam
-    tt = cam.constraints.new(type="TRACK_TO")
-    tt.target = arm
-    tt.track_axis = "TRACK_NEGATIVE_Z"
-    tt.up_axis = "UP_Y"
+
+    _keyframe_camera_rig(scene, cam, empty, frames, elev_cam)
 
     scene.render.engine = "BLENDER_WORKBENCH"
     try:

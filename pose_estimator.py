@@ -67,7 +67,7 @@ def _analyze_legacy(video_path: str) -> List[Optional[Dict]]:
         model_complexity=1,
         enable_segmentation=False,
         min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_tracking_confidence=0.4,
     )
     all_poses: List[Optional[Dict]] = []
     try:
@@ -88,8 +88,8 @@ def _analyze_tasks(video_path: str) -> List[Optional[Dict]]:
         base_options=bo.BaseOptions(model_asset_path=model_path),
         running_mode=vision.RunningMode.VIDEO,
         min_pose_detection_confidence=0.5,
-        min_pose_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_pose_presence_confidence=0.45,
+        min_tracking_confidence=0.4,
     )
     landmarker = vision.PoseLandmarker.create_from_options(options)
     all_poses: List[Optional[Dict]] = []

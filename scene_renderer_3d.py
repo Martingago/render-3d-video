@@ -1,4 +1,5 @@
 import os
+import math
 import numpy as np
 import cv2
 import pyvista as pv
@@ -7,7 +8,7 @@ from typing import List, Dict, Any, Tuple, Optional
 pv.OFF_SCREEN = True
 
 # Default framing (override via render_sequence_pyvista kwargs)
-DEFAULT_CAMERA_SMOOTHING = 0.22
+DEFAULT_CAMERA_SMOOTHING = 0.32
 MIN_BONE_LENGTH = 0.024
 BONE_RADIUS = 0.041
 HEAD_RADIUS_FRAC = 0.42
@@ -51,6 +52,58 @@ def _camera_distance_from_span(joints: np.ndarray, scale: float = 1.22) -> float
     j = np.asarray(joints, dtype=np.float64)
     span = float(np.linalg.norm(j.max(axis=0) - j.min(axis=0)))
     return float(np.clip(span * scale, 2.0, 5.8))
+
+
+def _hybrid_camera_position(
+    focal: np.ndarray,
+    torso_R: np.ndarray,
+    joints: np.ndarray,
+    distance: Optional[float],
+    elevation_frac: float = 0.14,
+) -> np.ndarray:
+    """
+    Mezcla el forward del torso (columna Z de torso_R) con +Z mundo para un encuadre
+    tipo frente sin asumir solo un eje fijo. Yaw opcional PYVISTA_CAM_YAW_DEG.
+    Peso del cuerpo: PYVISTA_HYBRID_BODY_FORWARD_WEIGHT (0-1, defecto 0.7).
+    """
+    fpt = np.asarray(focal, dtype=np.float64).ravel()
+    fwd_body = _forward_vector(torso_R)
+    world_z = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    w = float(os.environ.get("PYVISTA_HYBRID_BODY_FORWARD_WEIGHT", "0.7"))
+    w = max(0.0, min(1.0, w))
+    fwd = w * fwd_body + (1.0 - w) * world_z
+    fwd = fwd / (np.linalg.norm(fwd) + 1e-9)
+    yaw_deg = float(os.environ.get("PYVISTA_CAM_YAW_DEG", "0"))
+    if abs(yaw_deg) > 1e-6:
+        yr = math.radians(yaw_deg)
+        cy, sy = math.cos(yr), math.sin(yr)
+        fwd = np.array(
+            [fwd[0] * cy - fwd[2] * sy, fwd[1], fwd[0] * sy + fwd[2] * cy],
+            dtype=np.float64,
+        )
+        fwd = fwd / (np.linalg.norm(fwd) + 1e-9)
+    up_b = _body_up_vector(torso_R)
+    dist = distance if distance is not None else _camera_distance_from_span(joints)
+    elev = elevation_frac * dist
+    return fpt - dist * fwd + elev * up_b
+
+
+def _world_front_camera_position(
+    focal: np.ndarray,
+    joints: np.ndarray,
+    distance: Optional[float],
+    elevation_frac: float = 0.18,
+) -> np.ndarray:
+    """
+    Cámara fija tipo 'frente': +Z respecto al torso, mirando al personaje (Y arriba).
+    Evita giros bruscos cuando el eje forward del torso se invierte.
+    """
+    fpt = np.asarray(focal, dtype=np.float64).ravel()
+    dist = distance if distance is not None else _camera_distance_from_span(joints)
+    offset = np.array(
+        [0.0, elevation_frac * dist, dist], dtype=np.float64
+    )
+    return fpt + offset
 
 
 def _stable_camera_position(
@@ -133,9 +186,15 @@ def render_sequence_pyvista(
     camera_elevation_frac: float = 0.14,
     bone_radius: float = BONE_RADIUS,
     show_skeleton_overlay: bool = True,
+    camera_view: Optional[str] = None,
 ) -> str:
     if not animated_sequence:
         return "Error: Empty animated sequence provided."
+
+    # hybrid: mezcla forward del torso con +Z mundo (recomendado). world: solo +Z. body: solo torso_R.
+    view_mode = (camera_view or os.environ.get("PYVISTA_CAMERA_VIEW", "hybrid")).strip().lower()
+    if view_mode not in ("body", "world", "world_front", "hybrid"):
+        view_mode = "hybrid"
 
     out_dir = os.path.dirname(os.path.abspath(output_path))
     if out_dir:
@@ -181,9 +240,18 @@ def render_sequence_pyvista(
 
             focal = _torso_focal_point(joints, pelvis)
             dist_i = camera_distance
-            raw_cam = _stable_camera_position(
-                focal, R, joints, dist_i, elevation_frac=camera_elevation_frac
-            )
+            if view_mode == "hybrid":
+                raw_cam = _hybrid_camera_position(
+                    focal, R, joints, dist_i, elevation_frac=camera_elevation_frac
+                )
+            elif view_mode in ("world", "world_front"):
+                raw_cam = _world_front_camera_position(
+                    focal, joints, dist_i, elevation_frac=camera_elevation_frac
+                )
+            else:
+                raw_cam = _stable_camera_position(
+                    focal, R, joints, dist_i, elevation_frac=camera_elevation_frac
+                )
             smoothed_cam = _smooth_camera(
                 raw_cam, smoothed_cam, camera_smoothing
             )

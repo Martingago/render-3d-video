@@ -55,8 +55,15 @@ except Exception:  # pragma: no cover - fallback topology
 IDX_L_SHOULDER, IDX_R_SHOULDER = 11, 12
 IDX_L_HIP, IDX_R_HIP = 23, 24
 
-SMOOTH_ALPHA = 0.35
+# Menor alpha = más suavizado (sigue menos el frame actual).
+SMOOTH_ALPHA = 0.22
 SCENE_AMPLITUDE = 2.2
+# MediaPipe z es ruidoso; reduce artefactos "doblados" en 3D.
+Z_RELATIVE_DAMP = 0.55
+# Evita explosión cuando hombros se cruzan / poca separación en imagen.
+MIN_TORSO_SCALE_NORM = 0.04
+# Máximo desplazamiento por articulación y frame tras suavizado (coords escena).
+MAX_JOINT_STEP = 0.11
 
 
 def pose_dict_to_xyz(pose_data: Dict) -> np.ndarray:
@@ -77,6 +84,18 @@ def shoulder_width_xy(pts: np.ndarray) -> float:
     return float(np.linalg.norm(d))
 
 
+def hip_width_xy(pts: np.ndarray) -> float:
+    d = pts[IDX_R_HIP, :2] - pts[IDX_L_HIP, :2]
+    return float(np.linalg.norm(d))
+
+
+def robust_torso_scale_xy(pts: np.ndarray) -> float:
+    """Escala de normalización estable: hombros, cadera o mínimo seguro."""
+    sw = shoulder_width_xy(pts)
+    hw = hip_width_xy(pts)
+    return float(max(sw, hw * 0.92, MIN_TORSO_SCALE_NORM))
+
+
 def hip_midpoint(pts: np.ndarray) -> np.ndarray:
     return 0.5 * (pts[IDX_L_HIP] + pts[IDX_R_HIP])
 
@@ -87,10 +106,12 @@ def shoulder_midpoint(pts: np.ndarray) -> np.ndarray:
 
 def mediapipe_to_scene_points(pts_centered: np.ndarray) -> np.ndarray:
     """Image x right, y down (MP) -> scene x right, y up, z forward-ish."""
-    out = np.empty_like(pts_centered)
-    out[:, 0] = pts_centered[:, 0]
-    out[:, 1] = -pts_centered[:, 1]
-    out[:, 2] = pts_centered[:, 2]
+    c = np.asarray(pts_centered, dtype=np.float64).copy()
+    c[:, 2] *= Z_RELATIVE_DAMP
+    out = np.empty_like(c)
+    out[:, 0] = c[:, 0]
+    out[:, 1] = -c[:, 1]
+    out[:, 2] = c[:, 2]
     return out * SCENE_AMPLITUDE
 
 
@@ -127,6 +148,31 @@ def torso_rotation_matrix(pts_scene: np.ndarray) -> np.ndarray:
     forward = forward / fn
 
     return np.column_stack([right, up, forward])
+
+
+def _stabilize_torso_R_forward(R: np.ndarray, R_prev: Optional[np.ndarray]) -> np.ndarray:
+    """Evita saltos de 180° en el eje forward del torso entre frames."""
+    R = np.asarray(R, dtype=np.float64).copy()
+    if R_prev is None:
+        return R
+    f = R[:, 2]
+    fp = R_prev[:, 2]
+    if float(np.dot(f, fp)) < 0.0:
+        R[:, 0] *= -1.0
+        R[:, 2] *= -1.0
+    return R
+
+
+def _velocity_clamp_joint_sequence(seq: List[np.ndarray], max_step: float) -> List[np.ndarray]:
+    if not seq:
+        return []
+    out: List[np.ndarray] = [seq[0].copy()]
+    for i in range(1, len(seq)):
+        delta = seq[i] - out[-1]
+        norms = np.linalg.norm(delta, axis=1, keepdims=True)
+        scale = np.minimum(1.0, max_step / np.maximum(norms, 1e-8))
+        out.append(out[-1] + delta * scale)
+    return out
 
 
 def _forward_fill_poses(poses_list: List[Optional[Dict]]) -> List[Dict]:
@@ -180,8 +226,7 @@ def map_pose_to_skeleton_frame(pose_data: Dict, scale_proxy: float) -> Dict:
     pts = pose_dict_to_xyz(pose_data)
     hip = hip_midpoint(pts)
     centered = pts - hip
-    sw = shoulder_width_xy(pts)
-    denom = max(sw, 1e-5)
+    denom = robust_torso_scale_xy(pts)
     normalized = centered / denom
     scene_pts = mediapipe_to_scene_points(normalized)
 
@@ -210,17 +255,21 @@ def animate_skeleton_sequence(poses_list: List[Optional[Dict]]) -> List[Dict]:
         pts = pose_dict_to_xyz(pose_data)
         hip = hip_midpoint(pts)
         centered = pts - hip
+        denom = robust_torso_scale_xy(pts)
         sw = shoulder_width_xy(pts)
-        denom = max(sw, 1e-5)
         per_frame_scale.append(sw)
         centered_norm.append(centered / denom)
 
     scene_raw = [mediapipe_to_scene_points(c) for c in centered_norm]
     scene_smooth = _ema_smooth_sequence(scene_raw)
+    scene_smooth = _velocity_clamp_joint_sequence(scene_smooth, MAX_JOINT_STEP)
 
     animated: List[Dict] = []
+    R_prev: Optional[np.ndarray] = None
     for i, scene_pts in enumerate(scene_smooth):
         R = torso_rotation_matrix(scene_pts)
+        R = _stabilize_torso_R_forward(R, R_prev)
+        R_prev = R
         pelvis = hip_midpoint(scene_pts)
         animated.append(
             {

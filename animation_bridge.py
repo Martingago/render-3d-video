@@ -171,6 +171,7 @@ def build_mixamo_frame(
 
     return {
         "root_translation": pelvis_b.tolist(),
+        "joints_blender": [jb[i].tolist() for i in range(33)],
         "bones": bones,
     }
 
@@ -195,6 +196,7 @@ def skeleton_sequence_to_document(
         "frame_count": len(frames),
         "coordinate_space": "blender_z_up",
         "rotation_convention": "quaternion_wxyz_global_hint",
+        "joints_field": "joints_blender_33_world_hint",
         "bone_names": bone_names,
         "frames": frames,
     }

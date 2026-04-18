@@ -13,6 +13,7 @@ def render_sequence_to_video(
     camera_smoothing: Optional[float] = None,
     bone_radius: Optional[float] = None,
     show_skeleton_overlay: Optional[bool] = None,
+    camera_view: Optional[str] = None,
 ) -> str:
     """
     Renders the animated sequence with a procedural mannequin (bone cylinders + head)
@@ -28,6 +29,8 @@ def render_sequence_to_video(
         kwargs["bone_radius"] = bone_radius
     if show_skeleton_overlay is not None:
         kwargs["show_skeleton_overlay"] = show_skeleton_overlay
+    if camera_view is not None:
+        kwargs["camera_view"] = camera_view
 
     return render_sequence_pyvista(
         animated_sequence=animated_sequence,
