@@ -204,7 +204,12 @@ def _keyframe_camera_rig(scene, cam, empty, frames: list, elev_deg: float):
         cam.keyframe_insert(data_path="location", frame=fnum)
         direction = target - cam.location
         if direction.length > 1e-8:
-            cam.rotation_euler = direction.to_track_quat("NEG_Z", "Y").to_euler()
+            try:
+                quat = direction.to_track_quat("NEG_Z", "Y")
+            except ValueError:
+                # Blender 5.1+: solo acepta "-Z", no "NEG_Z"
+                quat = direction.to_track_quat("-Z", "Y")
+            cam.rotation_euler = quat.to_euler()
             cam.keyframe_insert(data_path="rotation_euler", frame=fnum)
 
 
@@ -365,18 +370,34 @@ def main() -> None:
             obj.hide_viewport = False
             obj.hide_render = False
 
-    scene.render.engine = "BLENDER_WORKBENCH"
-    try:
-        scene.display.shading.color_type = "MATERIAL"
-    except Exception:
-        pass
+    # Workbench en Blender 5.x puede no volcar animación FFmpeg a un único .mp4; EEVEE sí.
+    _wb_engine = "BLENDER_WORKBENCH"
+    for _eng in ("BLENDER_EEVEE", "BLENDER_EEVEE_NEXT", "CYCLES", _wb_engine):
+        try:
+            scene.render.engine = _eng
+            break
+        except (TypeError, ValueError):
+            continue
+    if scene.render.engine == _wb_engine:
+        try:
+            scene.display.shading.color_type = "MATERIAL"
+        except Exception:
+            pass
 
     scene.render.resolution_x = 1280
     scene.render.resolution_y = 720
 
     os.makedirs(os.path.dirname(out_mp4) or ".", exist_ok=True)
     mp4_path = out_mp4 if out_mp4.lower().endswith(".mp4") else out_mp4 + ".mp4"
-    scene.render.image_settings.file_format = "FFMPEG"
+
+    ims = scene.render.image_settings
+    media_before = getattr(ims, "media_type", None)
+    # Blender 5.x: media_type debe ir ANTES de file_format (release notes API); si no, no se genera el .mp4 único.
+    if hasattr(ims, "media_type"):
+        ims.media_type = "VIDEO"
+    ims.file_format = "FFMPEG"
+    if hasattr(ims, "media_type") and getattr(ims, "media_type", None) != "VIDEO":
+        ims.media_type = "VIDEO"
     ff = scene.render.ffmpeg
     if hasattr(ff, "format"):
         ff.format = "MPEG4"

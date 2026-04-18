@@ -13,9 +13,11 @@ from animation_bridge import export_sequence_to_json_file
 from blender_runner import (
     run_blender_pipeline_if_available,
     resolve_base_character,
+    project_abspath,
 )
 
 MAX_FILE_SIZE_MB = 20
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 ALLOWED_VIDEO_EXT = [".mp4", ".mov", ".avi"]
 
 app = Flask(__name__)
@@ -86,6 +88,7 @@ def upload_file():
         blender_glb = None
         blender_video = None
         blender_note = None
+        bl_result = None
         print("--- Step 5/5: Blender retarget (optional) ---")
         try:
             bl_result = run_blender_pipeline_if_available(
@@ -109,24 +112,47 @@ def upload_file():
         except Exception as be:
             blender_note = f"Blender error: {be}"
 
-        # Vídeo principal: render Blender (personaje retargeteado) si hubo MP4; si no, el preview PyVista.
-        primary_video_path = pyvista_preview_path
-        if blender_video and os.path.isfile(blender_video):
-            primary_video_path = blender_video
+        pyvista_preview_abs = project_abspath(pyvista_preview_path)
+        json_abs = project_abspath(json_path)
+        blender_glb_abs = project_abspath(blender_glb) if blender_glb else None
+        blender_video_abs = project_abspath(blender_video) if blender_video else None
+
+        # Vídeo principal: Blender si el MP4 existe (ruta absoluta, independiente del CWD).
+        primary_video_path = pyvista_preview_abs
+        video_primary_source = "pyvista"
+        video_primary_reason = None
+        if blender_video_abs and os.path.isfile(blender_video_abs):
+            primary_video_path = blender_video_abs
+            video_primary_source = "blender"
+        else:
+            if bl_result:
+                video_primary_reason = "blender_mp4_missing"
+            elif blender_note and "Blender error" in blender_note:
+                video_primary_reason = "blender_error"
+            elif blender_note and "omitido" in blender_note:
+                video_primary_reason = "blender_skipped"
+            else:
+                video_primary_reason = "blender_skipped"
+
+        if video_primary_source == "blender":
             print(f"--- Primary output: Blender character video -> {primary_video_path}")
         else:
-            print(f"--- Primary output: PyVista preview -> {primary_video_path}")
+            print(
+                f"--- Primary output: PyVista preview ({video_primary_reason}) -> {primary_video_path}"
+            )
 
         payload = {
             "message": "Pipeline completed successfully.",
             "uploaded_file": original_filename,
             "final_output_video": primary_video_path,
+            "video_primary_source": video_primary_source,
+            "video_primary_reason": video_primary_reason,
             "fps": fps,
             "download_url": f"/download/{os.path.basename(primary_video_path)}",
-            "pyvista_preview_video": pyvista_preview_path,
-            "animation_json": json_path,
-            "blender_glb": blender_glb,
-            "blender_video": blender_video,
+            "pyvista_preview_video": pyvista_preview_abs,
+            "animation_json": json_abs,
+            "blender_glb": blender_glb_abs,
+            "blender_video": blender_video_abs,
             "blender_note": blender_note,
         }
         if request.args.get("download") == "1":
@@ -149,7 +175,7 @@ def download_output(filename):
     safe = secure_filename(os.path.basename(filename))
     if not safe:
         return jsonify({"error": "Invalid filename."}), 400
-    path = os.path.join("outputs", safe)
+    path = os.path.join(PROJECT_ROOT, "outputs", safe)
     if not os.path.isfile(path):
         return jsonify({"error": "File not found."}), 404
     return send_file(path, as_attachment=True, download_name=safe)

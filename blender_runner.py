@@ -25,6 +25,12 @@ def resolve_blender_executable() -> Optional[str]:
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
+def project_abspath(path: str) -> str:
+    """Ruta absoluta estable respecto a la raíz del proyecto (no depende del CWD)."""
+    p = os.path.expanduser(path.strip())
+    return os.path.normpath(p if os.path.isabs(p) else os.path.join(_PROJECT_ROOT, p))
+
+
 def resolve_base_character() -> str:
     """
     Ruta al personaje en T-Pose (FBX o GLB).
@@ -90,8 +96,12 @@ def run_blender_retarget(
     if not os.path.isfile(input_model):
         raise FileNotFoundError(f"No existe el modelo base: {input_model}")
 
-    os.makedirs(os.path.dirname(os.path.abspath(output_glb)) or ".", exist_ok=True)
-    os.makedirs(os.path.dirname(os.path.abspath(output_mp4)) or ".", exist_ok=True)
+    json_path = project_abspath(json_path)
+    output_glb = project_abspath(output_glb)
+    output_mp4 = project_abspath(output_mp4)
+
+    os.makedirs(os.path.dirname(output_glb) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(output_mp4) or ".", exist_ok=True)
 
     cmd = [blender]
     if not _blender_use_gui():
@@ -101,10 +111,10 @@ def run_blender_retarget(
             "--python",
             script,
             "--",
-            os.path.abspath(json_path),
+            json_path,
             os.path.abspath(input_model),
-            os.path.abspath(output_glb),
-            os.path.abspath(output_mp4),
+            output_glb,
+            output_mp4,
             str(fps),
         ]
     )
@@ -124,6 +134,17 @@ def run_blender_retarget(
         if not inherit_console and proc.stderr is not None:
             msg = proc.stderr or proc.stdout or msg
         raise RuntimeError(f"Blender falló (código {proc.returncode}): {msg[:4000]}")
+    if not os.path.isfile(output_mp4):
+        outd = os.path.dirname(output_mp4)
+        mp4_in_dir = (
+            [f for f in os.listdir(outd) if f.lower().endswith(".mp4")]
+            if os.path.isdir(outd)
+            else []
+        )
+        raise RuntimeError(
+            f"Blender terminó (código 0) pero no existe el MP4 esperado: {output_mp4}. "
+            f"MP4 en la misma carpeta: {mp4_in_dir}"
+        )
     return output_glb, output_mp4
 
 
