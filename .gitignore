@@ -39,9 +39,14 @@ pytype/
 pyre/
 # Ruff linter cache
 ruff_cache/
+# Variables locales (rutas a Blender, modelo)
+.env
 # Streamlit secrets
 streamlit/secrets.toml
 # Files
 outputs/
 uploads/
 video_prueba/
+# Modelos 3D pesados (colocar localmente; ver assets/README.md)
+assets/*.glb
+assets/*.fbx

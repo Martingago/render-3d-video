@@ -1,11 +1,12 @@
 # Video-to-3D Animation Service
 
-API de backend que convierte un video de una persona en un MP4 de vista 3D off-screen: se estima la pose frame a frame, se construye un esqueleto coherente en el tiempo (con proxy de escala y suavizado), se orienta un modelo básico (cubo) al torso y se renderiza con **PyVista**.
+API de backend que convierte un video de una persona en un MP4 de vista 3D off-screen: se estima la pose frame a frame, se construye un esqueleto coherente en el tiempo (con proxy de escala y suavizado) y se renderiza con **PyVista** un **maniquí procedural** (cilindros por hueso + esfera en la nariz). La **cámara** sigue al torso (punto de mira entre pelvis y hombros, posición delante del cuerpo según `torso_R`, con suavizado temporal), no al centro del bounding box global, para evitar saltos de encuadre cuando se mueven brazos o piernas.
 
 ## Prerrequisitos
 
 - Python 3.8+ (en entornos donde el paquete `mediapipe` no incluye `solutions`, se usa la API **Tasks** y se descarga el modelo la primera vez a `models/pose_landmarker_lite.task`; hace falta red en ese primer arranque).
 - Dependencias: `pip install -r requirements.txt`
+- **Variables locales:** copia [`.env.example`](.env.example) a `.env` en la raíz del proyecto. Ahí defines la ruta al **`blender.exe`** (no uses la carpeta del menú Inicio de Windows; debe ser el ejecutable, p. ej. `C:\Program Files\Blender Foundation\Blender 4.2\blender.exe`) y, si quieres, `MIXAMO_BASE_CHARACTER` (por defecto se busca `assets/character.fbx` y luego `assets/character.glb`). La app carga `.env` al arrancar con `python-dotenv`.
 
 ## Ejecución
 
@@ -21,8 +22,10 @@ Servidor por defecto en `http://127.0.0.1:5000`.
 2. **Validación:** extensiones `.mp4`, `.mov`, `.avi` y límite de tamaño configurado en `app.py`.
 3. **Frames:** un resultado de pose por frame de video (si no hay detección en un frame, se rellena hacia adelante en el mapeo esquelético).
 4. **Pose:** MediaPipe (Solutions o Tasks según el wheel instalado).
-5. **Esqueleto 3D:** centrado en caderas, normalizado por ancho de hombros en imagen (proxy de distancia a cámara), ejes de escena con Y hacia arriba, suavizado temporal (EMA) y matriz de rotación del torso para el cubo.
-6. **Render:** PyVista off-screen — tubo para huesos y cubo en la pelvis.
+5. **Esqueleto 3D:** centrado en caderas, normalizado por ancho de hombros en imagen (proxy de distancia a cámara), ejes de escena con Y hacia arriba, suavizado temporal (EMA) y matriz `torso_R` para orientación del torso.
+6. **Render:** PyVista off-screen — maniquí (malla fusionada de cilindros por conexión MediaPipe + cabeza), tubo esquelético opcional semitransparente, cámara frontal respecto al torso con EMA sobre la posición de cámara.
+
+Un **personaje GLB riggeado con skinning** no forma parte de este pipeline: haría falta malla con pesos por hueso y retargeting; el maniquí es una aproximación volumétrica ligada directamente a las posiciones de las articulaciones.
 
 ## API
 
@@ -44,3 +47,22 @@ Con **una sola cámara RGB** no hay reconstrucción métrica perfecta: la profun
 | `skeleton_mapper.py` | Huesos, escala, suavizado, `torso_R`, `pelvis` |
 | `scene_renderer_3d.py` | PyVista → capturas → OpenCV `VideoWriter` |
 | `video_renderer.py` | Delega en `scene_renderer_3d` |
+| `animation_bridge.py` | Secuencia esquelética → JSON (cuaterniones wxyz + traslación raíz en espacio Blender Z-up) |
+| `blender_runner.py` | Subproceso: `blender --background --python .../retarget_render.py` |
+| `blender_pipeline/retarget_render.py` | Solo dentro de Blender (`bpy`): importa GLB, aplica keyframes, exporta GLB animado y MP4 (Workbench + FFmpeg) |
+
+## Pipeline Blender (opcional)
+
+Tras el render PyVista, el backend escribe `outputs/<nombre>_animation.json` y, **si** existen un modelo base y el ejecutable de Blender:
+
+- Modelo por defecto: el primero que exista entre [`assets/character.fbx`](assets/README.md) y `assets/character.glb`, o rutas en **`MIXAMO_BASE_CHARACTER`** / **`MIXAMO_BASE_GLB`** (personaje en T-Pose; convención de huesos tipo Mixamo: `Hips` o `mixamorig:Hips`, etc.). El script de Blender importa **FBX** o **GLB** según la extensión.
+- Ejecutable: **`BLENDER_EXECUTABLE`** (ruta absoluta recomendada en Windows) o `blender` / `blender.exe` en el `PATH`.
+
+Salidas adicionales en `outputs/`:
+
+- `<nombre>_blender.glb` — animación horneada en el rig.
+- `<nombre>_blender.mp4` — vista previa renderizada en Blender (distinta del MP4 PyVista).
+
+La respuesta JSON de `POST /upload` incluye `animation_json`, `blender_glb`, `blender_video` y `blender_note` (motivo si el paso se omite o falla).
+
+El retarget es **heurístico**: cuaterniones se derivan de direcciones hueso-a-hueso respecto a vectores de reposo aproximados; no sustituye a un retargeter profesional ni a skinning manual. Para un GLB concreto puede ser necesario ajustar `REST_BONE_DIRECTIONS` en `animation_bridge.py` o los alias en `retarget_render.py`.
