@@ -27,3 +27,5 @@ Desde la raíz del proyecto:
 ```
 
 (Linux/macOS: sustituir `^` por `\`.)
+
+En la API `/upload`, si Blender genera `*_blender.mp4`, ese archivo pasa a ser **`final_output_video`** y la descarga por defecto; el maniquí PyVista queda en **`pyvista_preview_video`** (`*_animated.mp4`).

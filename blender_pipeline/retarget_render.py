@@ -5,8 +5,10 @@ Ejecutar solo dentro de Blender:
       <animation.json> <entrada.fbx|glb> <salida.glb> <salida.mp4> <fps>
 
 Variables de entorno opcionales (cámara MP4):
-  BLENDER_CAM_OFFSET — "x,y,z" offset mundo desde el foco (defecto: 0.45,-5.2,2.0)
+  BLENDER_CAM_OFFSET — "x,y,z" offset mundo desde el foco a la cámara (defecto: 0.0,-7.5,0.45)
+  BLENDER_CAM_DISTANCE_SCALE — multiplica el offset (p. ej. 1.2 para alejar; defecto: 1.0)
   BLENDER_CAM_ELEV_DEG — elevación extra en grados (defecto: 0)
+  BLENDER_CAM_LENS — focal en mm (defecto: 50)
 
 bpy no está disponible en el intérprete del servidor Flask.
 """
@@ -44,14 +46,34 @@ LIMB_BONE_MP: tuple = (
 
 
 def _parse_cam_offset() -> tuple:
-    raw = os.environ.get("BLENDER_CAM_OFFSET", "0.45,-5.2,2.0").strip()
+    raw = os.environ.get("BLENDER_CAM_OFFSET", "0.0,-7.5,0.45").strip()
     try:
         parts = [float(x.strip()) for x in raw.split(",")]
         if len(parts) == 3:
             return tuple(parts)
     except ValueError:
         pass
-    return (0.45, -5.2, 2.0)
+    return (0.0, -7.5, 0.45)
+
+
+def _cam_offset_vector():
+    """Vector offset cámara con BLENDER_CAM_DISTANCE_SCALE opcional (>1 aleja)."""
+    from mathutils import Vector
+
+    off = Vector(_parse_cam_offset())
+    scale = float(os.environ.get("BLENDER_CAM_DISTANCE_SCALE", "1.0"))
+    if scale > 0.0 and abs(scale - 1.0) > 1e-9:
+        off *= scale
+    return off
+
+
+def _clear_scene_mesh_objects():
+    """Quita mallas del startup (p. ej. Default Cube) sin tocar cámara ni luces."""
+    import bpy
+
+    to_remove = [obj for obj in bpy.context.scene.objects if obj.type == "MESH"]
+    for obj in to_remove:
+        bpy.data.objects.remove(obj, do_unlink=True)
 
 
 def _focal_from_joints_blender(jb: list) -> "Vector":
@@ -151,7 +173,7 @@ def _swing_quat_from_world_dirs(arm, pb, v_target_world) -> "Quaternion":
 def _keyframe_camera_rig(scene, cam, empty, frames: list, elev_deg: float):
     from mathutils import Euler, Vector
 
-    off = Vector(_parse_cam_offset())
+    off = _cam_offset_vector()
     elev = math.radians(elev_deg)
     if abs(elev) > 1e-6:
         rot = Euler((elev, 0.0, 0.0), "XYZ")
@@ -217,6 +239,7 @@ def main() -> None:
 
     ext = os.path.splitext(in_model)[1].lower()
     bpy.ops.wm.read_factory_settings(use_empty=True)
+    _clear_scene_mesh_objects()
 
     if ext == ".fbx":
         bpy.ops.import_scene.fbx(
@@ -329,12 +352,18 @@ def main() -> None:
     empty = bpy.context.active_object
     empty.name = "CamTarget"
 
-    bpy.ops.object.camera_add(location=(0.0, -5.0, 2.0))
+    bpy.ops.object.camera_add(location=(0.0, -4.5, 1.2))
     cam = bpy.context.active_object
     cam.name = "RenderCam"
+    cam.data.lens = float(os.environ.get("BLENDER_CAM_LENS", "50"))
     scene.camera = cam
 
     _keyframe_camera_rig(scene, cam, empty, frames, elev_cam)
+
+    for obj in bpy.context.scene.objects:
+        if obj.type == "MESH":
+            obj.hide_viewport = False
+            obj.hide_render = False
 
     scene.render.engine = "BLENDER_WORKBENCH"
     try:
