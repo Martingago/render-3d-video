@@ -9,6 +9,16 @@ Variables de entorno opcionales (cámara MP4):
   BLENDER_CAM_DISTANCE_SCALE — multiplica el offset (p. ej. 1.2 para alejar; defecto: 1.0)
   BLENDER_CAM_ELEV_DEG — elevación extra en grados (defecto: 0)
   BLENDER_CAM_LENS — focal en mm (defecto: 50)
+  BLENDER_CAM_ROLL_DEG — giro extra alrededor del eje de vista (defecto: 180; prueba 0 si el personaje queda mal)
+
+Motor y velocidad de render:
+  BLENDER_RENDER_ENGINE — WORKBENCH (defecto, rápido, sin luces) o EEVEE (más lento, más realista)
+  BLENDER_RENDER_SCALE_PERCENT — 10–100, porcentaje de resolución del MP4 (defecto: 100; bajar acelera)
+
+Iluminación EEVEE (solo si BLENDER_RENDER_ENGINE=EEVEE):
+  BLENDER_WORLD_STRENGTH — fuerza del fondo (defecto: 0.42)
+  BLENDER_SUN_ENERGY — energía del sol (defecto: 14)
+  BLENDER_FILL_WATTS — área de relleno (defecto: 900)
 
 bpy no está disponible en el intérprete del servidor Flask.
 """
@@ -170,8 +180,69 @@ def _swing_quat_from_world_dirs(arm, pb, v_target_world) -> "Quaternion":
     return d_rest_w.rotation_difference(vt)
 
 
+def _setup_eevee_lighting(scene):
+    """Mundo con ambiente suave + sol principal + área de relleno (EEVEE)."""
+    import bpy
+    from mathutils import Euler
+
+    world = scene.world
+    if world is None:
+        world = bpy.data.worlds.new("RenderWorld")
+        scene.world = world
+    world.use_nodes = True
+    nt = world.node_tree
+    bg = nt.nodes.get("Background")
+    if bg is None:
+        bg = nt.nodes.new(type="ShaderNodeBackground")
+    out = nt.nodes.get("World Output")
+    if out is None:
+        out = nt.nodes.new(type="ShaderNodeOutputWorld")
+    if not out.inputs["Surface"].is_linked:
+        nt.links.new(bg.outputs["Background"], out.inputs["Surface"])
+    bg.inputs["Color"].default_value = (0.07, 0.08, 0.11, 1.0)
+    bg.inputs["Strength"].default_value = float(
+        os.environ.get("BLENDER_WORLD_STRENGTH", "0.42")
+    )
+
+    sun_e = float(os.environ.get("BLENDER_SUN_ENERGY", "14"))
+    fill_w = float(os.environ.get("BLENDER_FILL_WATTS", "900"))
+
+    bpy.ops.object.light_add(type="SUN", location=(8.0, -7.0, 14.0))
+    key = bpy.context.active_object
+    key.name = "KeySun"
+    key.data.energy = sun_e
+    if hasattr(key.data, "angle"):
+        key.data.angle = math.radians(0.55)
+    key.rotation_euler = Euler(
+        (math.radians(52), math.radians(-38), math.radians(28)), "XYZ"
+    )
+
+    bpy.ops.object.light_add(type="AREA", location=(-6.5, 5.0, 5.0))
+    fill = bpy.context.active_object
+    fill.name = "FillArea"
+    fill.data.shape = "DISK"
+    if hasattr(fill.data, "size"):
+        fill.data.size = 4.5
+    fill.data.energy = fill_w
+    fill.rotation_euler = Euler(
+        (math.radians(72), math.radians(12), math.radians(-52)), "XYZ"
+    )
+
+
+def _setup_workbench_shading(scene):
+    """Workbench: sin luces de escena; FLAT + MATERIAL es claro y muy rápido."""
+    ds = scene.display.shading
+    if hasattr(ds, "light"):
+        ds.light = "FLAT"
+    if hasattr(ds, "color_type"):
+        ds.color_type = "MATERIAL"
+    for attr, val in (("show_object_outline", False), ("show_cavity", False)):
+        if hasattr(ds, attr):
+            setattr(ds, attr, val)
+
+
 def _keyframe_camera_rig(scene, cam, empty, frames: list, elev_deg: float):
-    from mathutils import Euler, Vector
+    from mathutils import Euler, Quaternion, Vector
 
     off = _cam_offset_vector()
     elev = math.radians(elev_deg)
@@ -204,12 +275,17 @@ def _keyframe_camera_rig(scene, cam, empty, frames: list, elev_deg: float):
         cam.keyframe_insert(data_path="location", frame=fnum)
         direction = target - cam.location
         if direction.length > 1e-8:
-            try:
-                quat = direction.to_track_quat("NEG_Z", "Y")
-            except ValueError:
-                # Blender 5.1+: solo acepta "-Z", no "NEG_Z"
-                quat = direction.to_track_quat("-Z", "Y")
-            cam.rotation_euler = quat.to_euler()
+            fwd = direction.normalized()
+            # Cámara por defecto: -Z local es la vista. Menos ambiguo que to_track_quat (roll arbitrario).
+            base = Vector((0.0, 0.0, -1.0))
+            q_align = base.rotation_difference(fwd)
+            roll_deg = float(os.environ.get("BLENDER_CAM_ROLL_DEG", "180"))
+            roll_rad = math.radians(roll_deg)
+            if abs(roll_rad) > 1e-9:
+                q = Quaternion(fwd, roll_rad) @ q_align
+            else:
+                q = q_align
+            cam.rotation_euler = q.to_euler()
             cam.keyframe_insert(data_path="rotation_euler", frame=fnum)
 
 
@@ -349,10 +425,6 @@ def main() -> None:
     except TypeError:
         bpy.ops.export_scene.gltf(**export_kw)
 
-    bpy.ops.object.light_add(type="SUN", location=(6.0, -4.0, 10.0))
-    sun = bpy.context.active_object
-    sun.data.energy = 2.8
-
     bpy.ops.object.empty_add(type="PLAIN_AXES", location=(0.0, 0.0, 1.0))
     empty = bpy.context.active_object
     empty.name = "CamTarget"
@@ -370,28 +442,33 @@ def main() -> None:
             obj.hide_viewport = False
             obj.hide_render = False
 
-    # Workbench en Blender 5.x puede no volcar animación FFmpeg a un único .mp4; EEVEE sí.
-    _wb_engine = "BLENDER_WORKBENCH"
-    for _eng in ("BLENDER_EEVEE", "BLENDER_EEVEE_NEXT", "CYCLES", _wb_engine):
+    pref = os.environ.get("BLENDER_RENDER_ENGINE", "WORKBENCH").strip().upper()
+    _wb = "BLENDER_WORKBENCH"
+    if pref == "EEVEE":
+        _order = ("BLENDER_EEVEE", "BLENDER_EEVEE_NEXT", "CYCLES", _wb)
+    else:
+        _order = (_wb, "BLENDER_EEVEE", "BLENDER_EEVEE_NEXT", "CYCLES")
+    for _eng in _order:
         try:
             scene.render.engine = _eng
             break
         except (TypeError, ValueError):
             continue
-    if scene.render.engine == _wb_engine:
-        try:
-            scene.display.shading.color_type = "MATERIAL"
-        except Exception:
-            pass
+
+    if scene.render.engine == _wb:
+        _setup_workbench_shading(scene)
+    else:
+        _setup_eevee_lighting(scene)
 
     scene.render.resolution_x = 1280
     scene.render.resolution_y = 720
+    pct = float(os.environ.get("BLENDER_RENDER_SCALE_PERCENT", "100"))
+    scene.render.resolution_percentage = int(max(10, min(100, round(pct))))
 
     os.makedirs(os.path.dirname(out_mp4) or ".", exist_ok=True)
     mp4_path = out_mp4 if out_mp4.lower().endswith(".mp4") else out_mp4 + ".mp4"
 
     ims = scene.render.image_settings
-    media_before = getattr(ims, "media_type", None)
     # Blender 5.x: media_type debe ir ANTES de file_format (release notes API); si no, no se genera el .mp4 único.
     if hasattr(ims, "media_type"):
         ims.media_type = "VIDEO"
