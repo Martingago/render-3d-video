@@ -176,6 +176,33 @@ def build_mixamo_frame(
     }
 
 
+def _build_camera_hint(
+    skeleton_sequence: List[Dict[str, Any]],
+    frames: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Heurística estable (no es la cámara real del vídeo): punto de mira + ejes torso
+    del primer frame en espacio Blender.
+    """
+    if not frames or not skeleton_sequence:
+        return {}
+    roots = np.stack(
+        [np.asarray(f["root_translation"], dtype=np.float64).reshape(3) for f in frames],
+        axis=0,
+    )
+    look_at = np.median(roots, axis=0)
+    R0 = np.asarray(skeleton_sequence[0]["torso_R"], dtype=np.float64).reshape(3, 3)
+    fwd_scene = _normalize(R0[:, 2])
+    up_scene = _normalize(R0[:, 1])
+    fwd_b = _normalize(scene_point_to_blender(fwd_scene))
+    up_b = _normalize(scene_point_to_blender(up_scene))
+    return {
+        "look_at": look_at.tolist(),
+        "forward_blender": fwd_b.tolist(),
+        "up_blender": up_b.tolist(),
+    }
+
+
 def skeleton_sequence_to_document(
     skeleton_sequence: List[Dict[str, Any]],
     fps: float,
@@ -190,6 +217,7 @@ def skeleton_sequence_to_document(
     bone_names = sorted(
         set().union(*(f["bones"].keys() for f in frames)) if frames else []
     )
+    camera_hint = _build_camera_hint(skeleton_sequence, frames)
     return {
         "schema_version": SCHEMA_VERSION,
         "fps": float(fps),
@@ -198,6 +226,7 @@ def skeleton_sequence_to_document(
         "rotation_convention": "quaternion_wxyz_global_hint",
         "joints_field": "joints_blender_33_world_hint",
         "bone_names": bone_names,
+        "camera_hint": camera_hint,
         "frames": frames,
     }
 

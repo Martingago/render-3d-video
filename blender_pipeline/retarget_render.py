@@ -5,6 +5,9 @@ Ejecutar solo dentro de Blender:
       <animation.json> <entrada.fbx|glb> <salida.glb> <salida.mp4> <fps>
 
 Variables de entorno opcionales (cámara MP4):
+  BLENDER_CAM_MODE — follow (defecto, misma lógica que antes) o fixed (cámara estable)
+  BLENDER_CAM_FIXED_TARGET — focal_median (defecto) o root_median; solo modo fixed sin JSON hint
+  BLENDER_CAM_USE_JSON_HINT — 1/true: con fixed, usa camera_hint del JSON (look_at + forward del torso)
   BLENDER_CAM_OFFSET — "x,y,z" offset mundo desde el foco a la cámara (defecto: 0.0,-7.5,0.45)
   BLENDER_CAM_DISTANCE_SCALE — multiplica el offset (p. ej. 1.2 para alejar; defecto: 1.0)
   BLENDER_CAM_ELEV_DEG — elevación extra en grados (defecto: 0)
@@ -95,6 +98,71 @@ def _focal_from_joints_blender(jb: list) -> "Vector":
     hip = (j[23] + j[24]) * 0.5
     sh = (j[11] + j[12]) * 0.5
     return hip.lerp(sh, 0.55)
+
+
+def _frame_target_vector(frame: dict) -> "Vector":
+    """Punto de mira por frame (misma prioridad que la cámara follow)."""
+    from mathutils import Vector
+
+    jb = frame.get("joints_blender")
+    rt = frame.get("root_translation")
+    if jb and len(jb) >= 33:
+        return _focal_from_joints_blender(jb)
+    if rt is not None:
+        return Vector((float(rt[0]), float(rt[1]), float(rt[2])))
+    return Vector((0.0, 0.0, 1.0))
+
+
+def _median_vector(vectors: list) -> "Vector":
+    from mathutils import Vector
+
+    if not vectors:
+        return Vector((0.0, 0.0, 1.0))
+    xs = sorted(v.x for v in vectors)
+    ys = sorted(v.y for v in vectors)
+    zs = sorted(v.z for v in vectors)
+    n = len(vectors)
+    m = n // 2
+    if n % 2:
+        mx, my, mz = xs[m], ys[m], zs[m]
+    else:
+        mx = 0.5 * (xs[m - 1] + xs[m])
+        my = 0.5 * (ys[m - 1] + ys[m])
+        mz = 0.5 * (zs[m - 1] + zs[m])
+    return Vector((mx, my, mz))
+
+
+def _fixed_target_from_frames(frames: list, mode: str) -> "Vector":
+    from mathutils import Vector
+
+    m = (mode or "focal_median").strip().lower()
+    if m == "root_median":
+        roots = []
+        for fr in frames:
+            rt = fr.get("root_translation")
+            if rt is not None:
+                roots.append(Vector((float(rt[0]), float(rt[1]), float(rt[2]))))
+        return _median_vector(roots) if roots else Vector((0.0, 0.0, 1.0))
+    pts = [_frame_target_vector(fr) for fr in frames]
+    return _median_vector(pts)
+
+
+def _cam_euler_look_at(cam_pos: "Vector", look_at: "Vector"):
+    from mathutils import Quaternion, Vector
+
+    direction = look_at - cam_pos
+    if direction.length < 1e-8:
+        return None
+    fwd = direction.normalized()
+    base = Vector((0.0, 0.0, -1.0))
+    q_align = base.rotation_difference(fwd)
+    roll_deg = float(os.environ.get("BLENDER_CAM_ROLL_DEG", "180"))
+    roll_rad = math.radians(roll_deg)
+    if abs(roll_rad) > 1e-9:
+        q = Quaternion(fwd, roll_rad) @ q_align
+    else:
+        q = q_align
+    return q.to_euler()
 
 
 def _pick_armature():
@@ -241,8 +309,57 @@ def _setup_workbench_shading(scene):
             setattr(ds, attr, val)
 
 
-def _keyframe_camera_rig(scene, cam, empty, frames: list, elev_deg: float):
-    from mathutils import Euler, Quaternion, Vector
+def _parse_vec3(data, default=(0.0, 0.0, 1.0)):
+    from mathutils import Vector
+
+    if not data or len(data) != 3:
+        return Vector(default)
+    try:
+        return Vector((float(data[0]), float(data[1]), float(data[2])))
+    except (TypeError, ValueError):
+        return Vector(default)
+
+
+def _fixed_cam_from_hint(
+    look_at: "Vector",
+    forward_blender: "Vector",
+    up_blender: "Vector",
+    elev_deg: float,
+) -> "Vector":
+    """Posición cámara tipo frente al torso (forward del JSON = eje pecho en mundo Blender)."""
+    from mathutils import Vector
+
+    dist = max(_cam_offset_vector().length, 1e-4)
+    elev_rad = math.radians(elev_deg)
+    f = forward_blender.normalized()
+    if f.length < 1e-6:
+        f = Vector((0.0, 1.0, 0.0))
+    u = up_blender.normalized()
+    if u.length < 1e-6:
+        u = Vector((0.0, 0.0, 1.0))
+    if abs(f.dot(u)) > 0.98:
+        alt = Vector((0.0, 0.0, 1.0))
+        if abs(f.dot(alt)) > 0.95:
+            alt = Vector((1.0, 0.0, 0.0))
+        u = alt.normalized()
+    return look_at - dist * f + dist * math.sin(elev_rad) * u
+
+
+def _keyframe_camera_rig(
+    scene,
+    cam,
+    empty,
+    frames: list,
+    elev_deg: float,
+    cam_mode: str,
+    camera_hint: dict,
+    use_json_hint: bool,
+):
+    from mathutils import Euler, Vector
+
+    mode = (cam_mode or "follow").strip().lower()
+    if mode not in ("fixed", "follow"):
+        mode = "follow"
 
     off = _cam_offset_vector()
     elev = math.radians(elev_deg)
@@ -250,42 +367,55 @@ def _keyframe_camera_rig(scene, cam, empty, frames: list, elev_deg: float):
         rot = Euler((elev, 0.0, 0.0), "XYZ")
         off.rotate(rot)
 
+    if mode == "fixed":
+        hint_ok = (
+            use_json_hint
+            and isinstance(camera_hint, dict)
+            and camera_hint.get("look_at")
+            and camera_hint.get("forward_blender")
+        )
+        if hint_ok:
+            look_at = _parse_vec3(camera_hint["look_at"], (0.0, 0.0, 1.0))
+            fwd = _parse_vec3(camera_hint["forward_blender"], (0.0, 1.0, 0.0))
+            up_h = _parse_vec3(
+                camera_hint.get("up_blender"), (0.0, 0.0, 1.0)
+            )
+            cam_pos = _fixed_cam_from_hint(look_at, fwd, up_h, elev_deg)
+            rot_e = _cam_euler_look_at(cam_pos, look_at)
+        else:
+            fixed_kind = os.environ.get(
+                "BLENDER_CAM_FIXED_TARGET", "focal_median"
+            ).strip().lower()
+            look_at = _fixed_target_from_frames(frames, fixed_kind)
+            cam_pos = look_at + off
+            rot_e = _cam_euler_look_at(cam_pos, look_at)
+
+        for fi, _frame in enumerate(frames):
+            fnum = 1 + fi
+            scene.frame_set(fnum)
+            empty.location = look_at
+            empty.keyframe_insert(data_path="location", frame=fnum)
+            cam.location = cam_pos
+            cam.keyframe_insert(data_path="location", frame=fnum)
+            if rot_e is not None:
+                cam.rotation_euler = rot_e
+                cam.keyframe_insert(data_path="rotation_euler", frame=fnum)
+        return
+
+    # follow: una clave por frame (comportamiento anterior)
     for fi, frame in enumerate(frames):
         fnum = 1 + fi
         scene.frame_set(fnum)
-        jb = frame.get("joints_blender")
-        rt = frame.get("root_translation")
-        if jb and len(jb) >= 33:
-            target = _focal_from_joints_blender(jb)
-        elif rt is not None:
-            target = Vector(
-                (
-                    float(rt[0]),
-                    float(rt[1]),
-                    float(rt[2]),
-                )
-            )
-        else:
-            target = Vector((0.0, 0.0, 1.0))
+        target = _frame_target_vector(frame)
 
         empty.location = target
         empty.keyframe_insert(data_path="location", frame=fnum)
 
         cam.location = target + off
         cam.keyframe_insert(data_path="location", frame=fnum)
-        direction = target - cam.location
-        if direction.length > 1e-8:
-            fwd = direction.normalized()
-            # Cámara por defecto: -Z local es la vista. Menos ambiguo que to_track_quat (roll arbitrario).
-            base = Vector((0.0, 0.0, -1.0))
-            q_align = base.rotation_difference(fwd)
-            roll_deg = float(os.environ.get("BLENDER_CAM_ROLL_DEG", "180"))
-            roll_rad = math.radians(roll_deg)
-            if abs(roll_rad) > 1e-9:
-                q = Quaternion(fwd, roll_rad) @ q_align
-            else:
-                q = q_align
-            cam.rotation_euler = q.to_euler()
+        rot_e = _cam_euler_look_at(cam.location, target)
+        if rot_e is not None:
+            cam.rotation_euler = rot_e
             cam.keyframe_insert(data_path="rotation_euler", frame=fnum)
 
 
@@ -435,7 +565,25 @@ def main() -> None:
     cam.data.lens = float(os.environ.get("BLENDER_CAM_LENS", "50"))
     scene.camera = cam
 
-    _keyframe_camera_rig(scene, cam, empty, frames, elev_cam)
+    cam_mode = os.environ.get("BLENDER_CAM_MODE", "follow").strip().lower()
+    use_json_hint = os.environ.get("BLENDER_CAM_USE_JSON_HINT", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    camera_hint = doc.get("camera_hint") if isinstance(doc, dict) else None
+    if not isinstance(camera_hint, dict):
+        camera_hint = {}
+    _keyframe_camera_rig(
+        scene,
+        cam,
+        empty,
+        frames,
+        elev_cam,
+        cam_mode,
+        camera_hint,
+        use_json_hint,
+    )
 
     for obj in bpy.context.scene.objects:
         if obj.type == "MESH":
